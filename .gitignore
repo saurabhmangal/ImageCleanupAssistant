@@ -1,0 +1,30 @@
+# Test data and temp files
+_photo_test/
+_smart_test/
+_emulator_cache.json
+_emulator_smoke.log
+_smoke_launch.png
+_smoke_logcat.txt
+_tmp_litertlm.aar
+_tmp_litertlm.zip
+_tmp_litertlm_aar/
+_tmp_litertlm_sources.jar
+
+# APK build output
+*.apk
+
+# Claude config
+.claude/
+
+# Android build artifacts
+android-mobile/ImageCleanupAssistantAndroid/.gradle/
+android-mobile/ImageCleanupAssistantAndroid/build/
+android-mobile/ImageCleanupAssistantAndroid/app/build/
+android-mobile/ImageCleanupAssistantAndroid/local.properties
+
+# Android SDK / toolchain
+android-mobile/toolchain/
+
+# IDE
+.idea/
+*.iml
