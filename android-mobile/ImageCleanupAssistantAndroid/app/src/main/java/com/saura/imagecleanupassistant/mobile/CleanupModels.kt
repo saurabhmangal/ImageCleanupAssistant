@@ -17,6 +17,7 @@ enum class AppScreen {
 }
 
 const val ALL_SOURCE_ID = "__all__"
+const val ALL_FOLDERS_ID = "__all_folders__"
 
 data class ImageMetrics(
     val averageHash: String,
@@ -99,6 +100,11 @@ data class SourceOption(
     val count: Int
 )
 
+data class FolderOption(
+    val folder: String,
+    val count: Int
+)
+
 sealed interface CleanupEntry {
     val key: String
     val queueId: CleanupQueueId
@@ -135,45 +141,6 @@ data class DeleteCommand(
     val successMessage: String
 )
 
-enum class AiReviewLabel {
-    FORWARD,
-    PHOTO,
-    UNSURE
-}
-
-data class AiModelConfig(
-    val modelPath: String,
-    val modelName: String,
-    val sizeBytes: Long,
-    val importedAtMillis: Long,
-    val lastModifiedAtMillis: Long,
-    val backendLabel: String
-) {
-    val modelKey: String
-        get() = "$modelName|$sizeBytes|$lastModifiedAtMillis"
-
-    val sizeText: String
-        get() = formatBytes(sizeBytes)
-}
-
-data class AiReviewVerdict(
-    val imageId: Long,
-    val imageModifiedAtMillis: Long,
-    val label: AiReviewLabel,
-    val confidence: Int,
-    val reason: String,
-    val modelName: String,
-    val reviewedAtMillis: Long,
-    val backendLabel: String
-) {
-    val headline: String
-        get() = when (label) {
-            AiReviewLabel.FORWARD -> "AI says: likely forward"
-            AiReviewLabel.PHOTO -> "AI says: likely normal photo"
-            AiReviewLabel.UNSURE -> "AI says: unsure"
-        }
-}
-
 data class UiState(
     val hasPermission: Boolean = false,
     val isScanning: Boolean = false,
@@ -190,11 +157,8 @@ data class UiState(
     val lastScanMillis: Long? = null,
     val dismissedEntryKeys: Set<String> = emptySet(),
     val selectedEntryKeys: Set<String> = emptySet(),
-    val aiModelConfig: AiModelConfig? = null,
-    val aiVerdicts: Map<Long, AiReviewVerdict> = emptyMap(),
-    val isAiModelImporting: Boolean = false,
-    val isAiReviewRunning: Boolean = false,
-    val aiStatusText: String = "AI review is optional and currently off."
+    val selectedScanFolder: String? = null,
+    val availableFolders: List<FolderOption> = emptyList()
 ) {
     val activeReviewEntry: CleanupEntry?
         get() = entries.firstOrNull { it.key == activeReviewKey }
@@ -212,11 +176,14 @@ data class UiState(
             null -> null
         }
 
-    val activeAiVerdict: AiReviewVerdict?
+    val totalReclaimableBytes: Long
         get() {
-            val image = activeReviewImage ?: return null
-            val verdict = aiVerdicts[image.id] ?: return null
-            return verdict.takeIf { it.imageModifiedAtMillis == image.modifiedAtMillis }
+            var total = 0L
+            for (queue in queues) {
+                // Rough estimate: average image size per queue item
+                // For pairs, count the suggested-delete image
+            }
+            return total
         }
 }
 
@@ -288,7 +255,7 @@ fun formatBytes(bytes: Long): String {
     val value = bytes.toDouble()
     return when {
         value >= 1024.0 * 1024.0 * 1024.0 -> String.format("%.2f GB", value / (1024.0 * 1024.0 * 1024.0))
-        value >= 1024.0 * 1024.0 -> String.format("%.2f MB", value / (1024.0 * 1024.0))
+        value >= 1024.0 * 1024.0 -> String.format("%.1f MB", value / (1024.0 * 1024.0))
         value >= 1024.0 -> String.format("%.1f KB", value / 1024.0)
         else -> "${bytes} B"
     }

@@ -63,10 +63,9 @@ dependencies {
     implementation("androidx.compose.ui:ui-tooling-preview")
     implementation("androidx.compose.foundation:foundation")
     implementation("androidx.compose.material3:material3")
+    implementation("androidx.compose.material:material-icons-extended")
     implementation("com.google.android.material:material:1.12.0")
-    runtimeOnly("com.google.ai.edge.litertlm:litertlm-android:0.9.0-beta") {
-        exclude(group = "org.jetbrains.kotlin", module = "kotlin-reflect")
-    }
+
     implementation("io.coil-kt:coil-compose:2.7.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
 

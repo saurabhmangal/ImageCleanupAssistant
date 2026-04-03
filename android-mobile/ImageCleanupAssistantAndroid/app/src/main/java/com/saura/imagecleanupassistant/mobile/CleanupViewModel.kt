@@ -21,23 +21,8 @@ class CleanupViewModel(application: Application) : AndroidViewModel(application)
     private val _events = MutableSharedFlow<UiEvent>(extraBufferCapacity = 4)
     val events = _events.asSharedFlow()
 
-    init {
-        val restoredAiModel = repository.restoreAiModelConfig()
-        _state.value = _state.value.copy(
-            aiModelConfig = restoredAiModel,
-            aiVerdicts = repository.restoreAiVerdictCache(restoredAiModel),
-            aiStatusText = if (restoredAiModel == null) {
-                "AI review is optional and currently off."
-            } else {
-                "AI model ready: ${restoredAiModel.modelName}."
-            }
-        )
-    }
-
     fun restoreCachedStateIfAvailable() {
-        if (_state.value.isScanning || _state.value.imageCount > 0) {
-            return
-        }
+        if (_state.value.isScanning || _state.value.imageCount > 0) return
 
         val cachedSnapshot = repository.restoreSnapshotFromCache() ?: return
         val cachedSession = repository.restoreUiSession()
@@ -63,7 +48,7 @@ class CleanupViewModel(application: Application) : AndroidViewModel(application)
             statusText = if (scopedSnapshot.imagesById.isEmpty()) {
                 "No cached photos were found."
             } else {
-                "Restored your last review session. Rescan only when your library changes."
+                "Restored your last session. Rescan when your library changes."
             },
             summaryText = buildSummaryText(scopedSnapshot),
             queues = repository.buildQueueDefinitions(scopedSnapshot),
@@ -80,12 +65,10 @@ class CleanupViewModel(application: Application) : AndroidViewModel(application)
             imageCount = scopedSnapshot.imagesById.size,
             lastScanMillis = cachedSession?.lastScanMillis,
             dismissedEntryKeys = dismissedKeys,
-            selectedEntryKeys = emptySet(),
-            aiVerdicts = repository.pruneAiVerdicts(_state.value.aiVerdicts, cachedSnapshot.imagesById)
+            selectedEntryKeys = emptySet()
         )
         _state.value = restoredState
         repository.persistUiSession(restoredState)
-        repository.persistAiVerdictCache(restoredState.aiModelConfig, restoredState.aiVerdicts)
     }
 
     fun refreshPermission(hasPermission: Boolean) {
@@ -99,6 +82,18 @@ class CleanupViewModel(application: Application) : AndroidViewModel(application)
         )
         _state.value = updated
         repository.persistUiSession(updated)
+    }
+
+    fun loadAvailableFolders() {
+        viewModelScope.launch {
+            val folders = repository.queryAvailableFolders()
+            _state.value = _state.value.copy(availableFolders = folders)
+        }
+    }
+
+    fun selectScanFolder(folder: String?) {
+        val normalized = folder?.takeIf { it != ALL_FOLDERS_ID }
+        _state.value = _state.value.copy(selectedScanFolder = normalized)
     }
 
     fun scanLibrary() {
@@ -119,9 +114,11 @@ class CleanupViewModel(application: Application) : AndroidViewModel(application)
             repository.persistUiSession(scanningState)
 
             try {
-                val scannedSnapshot = repository.scanLibrary { progressText ->
-                    val progressState = _state.value.copy(statusText = progressText)
-                    _state.value = progressState
+                val folderFilter = _state.value.selectedScanFolder
+                val scannedSnapshot = repository.scanLibrary(
+                    folderFilter = folderFilter
+                ) { progressText ->
+                    _state.value = _state.value.copy(statusText = progressText)
                 }
 
                 snapshot = scannedSnapshot
@@ -140,12 +137,18 @@ class CleanupViewModel(application: Application) : AndroidViewModel(application)
                     dismissedEntryKeys = _state.value.dismissedEntryKeys
                 )
 
+                val totalItems = scopedSnapshot.exactPairs.size + scopedSnapshot.similarPairs.size +
+                    scopedSnapshot.blurryIds.size + scopedSnapshot.forwardIds.size +
+                    scopedSnapshot.screenshotIds.size + scopedSnapshot.textHeavyIds.size
+
                 val scannedState = _state.value.copy(
                     isScanning = false,
                     statusText = if (scopedSnapshot.imagesById.isEmpty()) {
                         "No photos were found on this device."
+                    } else if (totalItems == 0) {
+                        "Your library looks clean!"
                     } else {
-                        "Scan finished. Review queues are ready."
+                        "$totalItems items found to review."
                     },
                     summaryText = buildSummaryText(scopedSnapshot),
                     queues = repository.buildQueueDefinitions(scopedSnapshot),
@@ -156,12 +159,10 @@ class CleanupViewModel(application: Application) : AndroidViewModel(application)
                     activeReviewKey = entries.firstOrNull()?.key,
                     imageCount = scopedSnapshot.imagesById.size,
                     lastScanMillis = System.currentTimeMillis(),
-                    selectedEntryKeys = emptySet(),
-                    aiVerdicts = repository.pruneAiVerdicts(_state.value.aiVerdicts, scannedSnapshot.imagesById)
+                    selectedEntryKeys = emptySet()
                 )
                 _state.value = scannedState
                 repository.persistUiSession(scannedState)
-                repository.persistAiVerdictCache(scannedState.aiModelConfig, scannedState.aiVerdicts)
             } catch (error: Exception) {
                 val failedState = _state.value.copy(
                     isScanning = false,
@@ -201,7 +202,7 @@ class CleanupViewModel(application: Application) : AndroidViewModel(application)
             statusText = if (scopedSnapshot.imagesById.isEmpty()) {
                 "No photos found in this source."
             } else {
-                "${scopedSnapshot.imagesById.size} photo(s) ready in ${sourceLabel(normalizedSourceId, availableSources)}."
+                "${scopedSnapshot.imagesById.size} photo(s) in ${sourceLabel(normalizedSourceId, availableSources)}."
             }
         )
         _state.value = updated
@@ -220,7 +221,7 @@ class CleanupViewModel(application: Application) : AndroidViewModel(application)
             statusText = if (entries.isEmpty()) {
                 queueDefinition(queueId).emptyText
             } else {
-                "${entries.size} item(s) ready in ${queueDefinition(queueId).title}."
+                "${entries.size} item(s) in ${queueDefinition(queueId).title}."
             }
         )
         _state.value = updated
@@ -241,10 +242,7 @@ class CleanupViewModel(application: Application) : AndroidViewModel(application)
 
     fun startEntrySelection(entryKey: String) {
         val current = _state.value
-        if (current.entries.none { it.key == entryKey }) {
-            return
-        }
-
+        if (current.entries.none { it.key == entryKey }) return
         val updated = current.copy(
             activeReviewKey = entryKey,
             selectedEntryKeys = setOf(entryKey)
@@ -255,10 +253,7 @@ class CleanupViewModel(application: Application) : AndroidViewModel(application)
 
     fun toggleEntrySelection(entryKey: String) {
         val current = _state.value
-        if (current.entries.none { it.key == entryKey }) {
-            return
-        }
-
+        if (current.entries.none { it.key == entryKey }) return
         val updatedKeys = if (entryKey in current.selectedEntryKeys) {
             current.selectedEntryKeys - entryKey
         } else {
@@ -274,9 +269,7 @@ class CleanupViewModel(application: Application) : AndroidViewModel(application)
 
     fun clearSelectedEntries() {
         val current = _state.value
-        if (current.selectedEntryKeys.isEmpty()) {
-            return
-        }
+        if (current.selectedEntryKeys.isEmpty()) return
         val updated = current.copy(selectedEntryKeys = emptySet())
         _state.value = updated
         repository.persistUiSession(updated)
@@ -284,9 +277,7 @@ class CleanupViewModel(application: Application) : AndroidViewModel(application)
 
     fun selectAllEntries() {
         val current = _state.value
-        if (current.entries.isEmpty()) {
-            return
-        }
+        if (current.entries.isEmpty()) return
         val updated = current.copy(selectedEntryKeys = current.entries.map { it.key }.toSet())
         _state.value = updated
         repository.persistUiSession(updated)
@@ -294,10 +285,7 @@ class CleanupViewModel(application: Application) : AndroidViewModel(application)
 
     fun moveSelection(step: Int) {
         val current = _state.value
-        if (current.entries.isEmpty()) {
-            return
-        }
-
+        if (current.entries.isEmpty()) return
         val currentIndex = current.entries.indexOfFirst { it.key == current.activeReviewKey }
             .takeIf { it >= 0 } ?: 0
         val nextIndex = (currentIndex + step).coerceIn(0, current.entries.lastIndex)
@@ -320,6 +308,7 @@ class CleanupViewModel(application: Application) : AndroidViewModel(application)
             entries = newEntries,
             activeReviewKey = nextEntry?.key,
             selectedEntryKeys = emptySet(),
+            queues = repository.buildQueueDefinitions(currentScopedSnapshot()),
             statusText = if (newEntries.isEmpty()) {
                 queueDefinition(current.selectedQueueId).emptyText
             } else {
@@ -377,9 +366,7 @@ class CleanupViewModel(application: Application) : AndroidViewModel(application)
     fun keepSelectedEntries() {
         val current = _state.value
         val selectedEntries = current.selectedEntries
-        if (selectedEntries.isEmpty()) {
-            return
-        }
+        if (selectedEntries.isEmpty()) return
 
         val dismissedKeys = selectedEntries.map { scopedEntryKey(current.selectedQueueId, it.key) }.toSet()
         val newDismissedKeys = current.dismissedEntryKeys + dismissedKeys
@@ -402,9 +389,7 @@ class CleanupViewModel(application: Application) : AndroidViewModel(application)
     fun requestDeleteSelectedEntries() {
         val current = _state.value
         val selectedEntries = current.selectedEntries
-        if (selectedEntries.isEmpty()) {
-            return
-        }
+        if (selectedEntries.isEmpty()) return
 
         val imagesToDelete = linkedMapOf<Long, Uri>()
         if (current.selectedQueueId.isPairQueue()) {
@@ -418,9 +403,7 @@ class CleanupViewModel(application: Application) : AndroidViewModel(application)
             }
         }
 
-        if (imagesToDelete.isEmpty()) {
-            return
-        }
+        if (imagesToDelete.isEmpty()) return
 
         val successMessage = if (current.selectedQueueId.isPairQueue()) {
             "Deleted recommended photos from ${selectedEntries.size} selected pair(s)."
@@ -438,9 +421,7 @@ class CleanupViewModel(application: Application) : AndroidViewModel(application)
     }
 
     fun onDeleteRequestCompleted(command: DeleteCommand?, wasApproved: Boolean) {
-        if (command == null) {
-            return
-        }
+        if (command == null) return
 
         if (!wasApproved) {
             _events.tryEmit(UiEvent.ShowMessage("Delete canceled."))
@@ -455,7 +436,6 @@ class CleanupViewModel(application: Application) : AndroidViewModel(application)
         val scopedSnapshot = repository.filterSnapshotBySource(snapshot, selectedSourceId)
         val selectedQueue = choosePreferredQueue(scopedSnapshot, current.selectedQueueId)
         val newEntries = repository.buildEntries(scopedSnapshot, selectedQueue, current.dismissedEntryKeys)
-        val prunedAiVerdicts = repository.pruneAiVerdicts(current.aiVerdicts, snapshot.imagesById)
         val updated = _state.value.copy(
             summaryText = buildSummaryText(scopedSnapshot),
             queues = repository.buildQueueDefinitions(scopedSnapshot),
@@ -466,105 +446,10 @@ class CleanupViewModel(application: Application) : AndroidViewModel(application)
             activeReviewKey = newEntries.firstOrNull()?.key,
             imageCount = scopedSnapshot.imagesById.size,
             selectedEntryKeys = emptySet(),
-            aiVerdicts = prunedAiVerdicts,
             statusText = command.successMessage
         )
         _state.value = updated
         repository.persistUiSession(updated)
-        repository.persistAiVerdictCache(updated.aiModelConfig, updated.aiVerdicts)
-    }
-
-    fun importAiModel(uri: Uri) {
-        if (_state.value.isAiModelImporting || _state.value.isAiReviewRunning) {
-            return
-        }
-
-        viewModelScope.launch {
-            val importingState = _state.value.copy(
-                isAiModelImporting = true,
-                aiStatusText = "Importing AI model..."
-            )
-            _state.value = importingState
-            try {
-                val modelConfig = repository.importAiModel(uri)
-                val updated = _state.value.copy(
-                    aiModelConfig = modelConfig,
-                    aiVerdicts = emptyMap(),
-                    isAiModelImporting = false,
-                    aiStatusText = "AI model ready: ${modelConfig.modelName}."
-                )
-                _state.value = updated
-                repository.persistUiSession(updated)
-            } catch (error: Exception) {
-                val failed = _state.value.copy(
-                    isAiModelImporting = false,
-                    aiStatusText = "AI model import failed."
-                )
-                _state.value = failed
-                repository.persistUiSession(failed)
-                _events.emit(UiEvent.ShowMessage(error.message ?: "Unable to import the AI model."))
-            }
-        }
-    }
-
-    fun clearAiModel() {
-        if (_state.value.isAiModelImporting || _state.value.isAiReviewRunning) {
-            return
-        }
-
-        repository.clearAiModel()
-        val updated = _state.value.copy(
-            aiModelConfig = null,
-            aiVerdicts = emptyMap(),
-            aiStatusText = "AI review is optional and currently off."
-        )
-        _state.value = updated
-        repository.persistUiSession(updated)
-    }
-
-    fun runAiReviewForCurrentEntry() {
-        val current = _state.value
-        val image = current.activeReviewImage ?: return
-        val modelConfig = current.aiModelConfig ?: run {
-            _events.tryEmit(UiEvent.ShowMessage("Import a Gemma .litertlm model first."))
-            return
-        }
-        if (current.selectedQueueId != CleanupQueueId.FORWARD || current.isAiReviewRunning) {
-            return
-        }
-
-        current.activeAiVerdict?.let { verdict ->
-            _events.tryEmit(UiEvent.ShowMessage("${verdict.headline}"))
-            return
-        }
-
-        viewModelScope.launch {
-            val runningState = _state.value.copy(
-                isAiReviewRunning = true,
-                aiStatusText = "Running AI check for ${image.name}..."
-            )
-            _state.value = runningState
-            try {
-                val verdict = repository.reviewForwardImageWithAi(image, modelConfig)
-                val updatedVerdicts = runningState.aiVerdicts + (image.id to verdict)
-                val updated = _state.value.copy(
-                    isAiReviewRunning = false,
-                    aiVerdicts = updatedVerdicts,
-                    aiStatusText = "${verdict.headline} (${verdict.confidence}%)."
-                )
-                _state.value = updated
-                repository.persistUiSession(updated)
-                repository.persistAiVerdictCache(updated.aiModelConfig, updated.aiVerdicts)
-            } catch (error: Exception) {
-                val failed = _state.value.copy(
-                    isAiReviewRunning = false,
-                    aiStatusText = "AI check failed."
-                )
-                _state.value = failed
-                repository.persistUiSession(failed)
-                _events.emit(UiEvent.ShowMessage(error.message ?: "AI check failed."))
-            }
-        }
     }
 
     private fun launchDeleteCommand(command: DeleteCommand) {
@@ -575,35 +460,18 @@ class CleanupViewModel(application: Application) : AndroidViewModel(application)
         snapshot: CleanupSnapshot,
         preferredQueueId: CleanupQueueId
     ): CleanupQueueId {
-        if (repository.queueCount(snapshot, preferredQueueId) > 0) {
-            return preferredQueueId
-        }
-
+        if (repository.queueCount(snapshot, preferredQueueId) > 0) return preferredQueueId
         return defaultQueueDefinitions()
             .firstOrNull { repository.queueCount(snapshot, it.id) > 0 }
-            ?.id
-            ?: preferredQueueId
+            ?.id ?: preferredQueueId
     }
 
     private fun buildSummaryText(snapshot: CleanupSnapshot): String {
-        val exactCount = snapshot.exactPairs.size
-        val similarCount = snapshot.similarPairs.size
-        val blurryCount = snapshot.blurryIds.size
-        val forwardCount = snapshot.forwardIds.size
-        val screenshotCount = snapshot.screenshotIds.size
-        val textHeavyCount = snapshot.textHeavyIds.size
-
-        return if (snapshot.imagesById.isEmpty()) {
-            "No photos scanned yet."
-        } else {
-            "${snapshot.imagesById.size} photos scanned | " +
-                "$exactCount exact duplicates | " +
-                "$similarCount similar pairs | " +
-                "$blurryCount blurry | " +
-                "$forwardCount forwards | " +
-                "$screenshotCount screenshots | " +
-                "$textHeavyCount text-heavy"
-        }
+        val total = snapshot.exactPairs.size + snapshot.similarPairs.size +
+            snapshot.blurryIds.size + snapshot.forwardIds.size +
+            snapshot.screenshotIds.size + snapshot.textHeavyIds.size
+        return if (snapshot.imagesById.isEmpty()) "No photos scanned yet."
+        else "${snapshot.imagesById.size} photos scanned, $total items to review."
     }
 
     private fun currentScopedSnapshot(fullSnapshot: CleanupSnapshot = snapshot): CleanupSnapshot =
