@@ -48,3 +48,9 @@ powershell.exe -ExecutionPolicy Bypass -Sta -File .\ImageCleanupAssistant.ps1 -I
 - Supported formats: `.jpg`, `.jpeg`, `.png`, `.bmp`, `.gif`, `.tif`, `.tiff`
 - Similar-photo, blur, and forward detection are heuristic, so review the preview before deleting.
 - Unreadable image files are skipped instead of crashing the app.
+
+## Behind the Scenes
+
+Check out this video for a behind-the-scenes look at the application development process:
+
+[Image Cleanup Assistant - Development Journey](https://youtu.be/wogtY7yj4sc)
