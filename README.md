@@ -53,4 +53,4 @@ powershell.exe -ExecutionPolicy Bypass -Sta -File .\ImageCleanupAssistant.ps1 -I
 
 Check out this video for a behind-the-scenes look at the application development process:
 
-[Image Cleanup Assistant - Development Journey](https://youtu.be/wogtY7yj4sc)
+[Image Cleanup Assistant - Development Journey](https://youtu.be/wogtY7yj4sc) - https://youtu.be/wogtY7yj4sc
