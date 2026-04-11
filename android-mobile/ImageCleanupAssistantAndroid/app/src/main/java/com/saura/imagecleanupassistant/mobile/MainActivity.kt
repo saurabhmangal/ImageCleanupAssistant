@@ -2,9 +2,12 @@ package com.saura.imagecleanupassistant.mobile
 
 import android.Manifest
 import android.app.Activity
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
+import android.os.Environment
 import android.os.Bundle
+import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -67,6 +70,10 @@ import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material.icons.rounded.SelectAll
 import androidx.compose.material.icons.rounded.Shield
 import androidx.compose.material.icons.rounded.TextFields
+import androidx.compose.material.icons.automirrored.filled.CloudQueue
+import androidx.compose.material.icons.filled.CloudDone
+import androidx.compose.material.icons.filled.CloudOff
+import androidx.compose.material.icons.filled.Sync
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
@@ -84,6 +91,8 @@ import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.lightColorScheme
+import androidx.compose.material3.AssistChip
+import androidx.compose.material3.AssistChipDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -168,6 +177,7 @@ private fun MobileCleanupApp(viewModel: CleanupViewModel) {
     val snackbarHostState = remember { SnackbarHostState() }
     var pendingDeleteCommand by remember { mutableStateOf<DeleteCommand?>(null) }
     var fullscreenPreview by remember { mutableStateOf<MediaImage?>(null) }
+    var showErrorDialog by remember { mutableStateOf<AppError?>(null) }
 
     val permission = remember {
         if (Build.VERSION.SDK_INT >= 33) Manifest.permission.READ_MEDIA_IMAGES
@@ -178,6 +188,7 @@ private fun MobileCleanupApp(viewModel: CleanupViewModel) {
         contract = ActivityResultContracts.RequestPermission()
     ) { granted ->
         viewModel.refreshPermission(granted)
+        viewModel.refreshRemoteCapabilities()
         if (granted) {
             viewModel.restoreCachedStateIfAvailable()
             if (viewModel.state.value.imageCount == 0) viewModel.scanLibrary()
@@ -194,10 +205,17 @@ private fun MobileCleanupApp(viewModel: CleanupViewModel) {
         pendingDeleteCommand = null
     }
 
+    val manageFilesLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartActivityForResult()
+    ) {
+        viewModel.refreshRemoteCapabilities()
+    }
+
     LaunchedEffect(Unit) {
         val has = ContextCompat.checkSelfPermission(context, permission) == PackageManager.PERMISSION_GRANTED
         viewModel.refreshPermission(has)
         if (has) viewModel.restoreCachedStateIfAvailable()
+        viewModel.refreshRemoteCapabilities()
     }
 
     LaunchedEffect(Unit) {
@@ -211,6 +229,7 @@ private fun MobileCleanupApp(viewModel: CleanupViewModel) {
                     deleteLauncher.launch(IntentSenderRequest.Builder(request.intentSender).build())
                 }
                 is UiEvent.ShowMessage -> snackbarHostState.showSnackbar(event.message)
+                is UiEvent.ShowError -> showErrorDialog = event.error
             }
         }
     }
@@ -229,7 +248,11 @@ private fun MobileCleanupApp(viewModel: CleanupViewModel) {
                 onSelectSource = viewModel::selectSource,
                 onOpenQueue = viewModel::openQueue,
                 onSelectFolder = viewModel::selectScanFolder,
-                onLoadFolders = viewModel::loadAvailableFolders
+                onLoadFolders = viewModel::loadAvailableFolders,
+                onToggleRemoteAccess = viewModel::toggleRemoteAccess,
+                onGrantDeleteAccess = {
+                    manageFilesLauncher.launch(buildManageFilesAccessIntent())
+                }
             )
             AppScreen.REVIEW -> ReviewScreen(
                 state = state,
@@ -260,6 +283,20 @@ private fun MobileCleanupApp(viewModel: CleanupViewModel) {
         FullscreenImageDialog(image = image, onDismiss = { fullscreenPreview = null })
     }
 
+    showErrorDialog?.let { error ->
+        ErrorRecoveryDialog(
+            error = error,
+            onRetry = {
+                viewModel.retryLastOperation()
+                showErrorDialog = null
+            },
+            onDismiss = {
+                showErrorDialog = null
+                viewModel.clearError()
+            }
+        )
+    }
+
     BackHandler(enabled = fullscreenPreview != null) { fullscreenPreview = null }
     BackHandler(enabled = fullscreenPreview == null && state.screen == AppScreen.REVIEW && state.isSelectionMode) { viewModel.clearSelectedEntries() }
     BackHandler(enabled = fullscreenPreview == null && state.screen == AppScreen.REVIEW && !state.isSelectionMode) { viewModel.returnToOverview() }
@@ -272,7 +309,8 @@ private fun OverviewScreen(
     state: UiState, modifier: Modifier = Modifier,
     onGrantPermission: () -> Unit, onScan: () -> Unit,
     onSelectSource: (String) -> Unit, onOpenQueue: (CleanupQueueId) -> Unit,
-    onSelectFolder: (String?) -> Unit, onLoadFolders: () -> Unit
+    onSelectFolder: (String?) -> Unit, onLoadFolders: () -> Unit,
+    onToggleRemoteAccess: () -> Unit, onGrantDeleteAccess: () -> Unit
 ) {
     val totalQueueItems = state.queues.sumOf { it.count }
 
@@ -287,12 +325,13 @@ private fun OverviewScreen(
             .navigationBarsPadding()
             .verticalScroll(rememberScrollState())
     ) {
-        // Top bar
+        // Top bar with connection status
         Row(
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(horizontal = 20.dp, vertical = 16.dp),
-            verticalAlignment = Alignment.CenterVertically
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
         ) {
             Text(
                 "Clean up",
@@ -300,6 +339,8 @@ private fun OverviewScreen(
                 fontWeight = FontWeight.Bold,
                 color = TextDark
             )
+            
+            ConnectionStatusChip(networkStatus = state.networkStatus)
         }
 
         // Hero summary card
@@ -315,6 +356,14 @@ private fun OverviewScreen(
         // Scanning progress
         AnimatedVisibility(visible = state.isScanning) {
             ScanProgressCard(statusText = state.statusText)
+        }
+
+        if (state.hasPermission) {
+            RemoteAccessCard(
+                remoteAccess = state.remoteAccess,
+                onToggleRemoteAccess = onToggleRemoteAccess,
+                onGrantDeleteAccess = onGrantDeleteAccess
+            )
         }
 
         // Folder picker
@@ -406,7 +455,7 @@ private fun HeroSummaryCard(
                 )
                 Text(
                     text = if (state.hasPermission) "Scan your library to find cleanup opportunities."
-                    else "Grant access to find duplicates, blurry photos, forwards, and more.",
+                    else "Grant access to find duplicates, low-quality shots, screenshots, documents, and clutter.",
                     style = MaterialTheme.typography.bodyMedium,
                     color = TextMedium,
                     textAlign = TextAlign.Center
@@ -484,6 +533,101 @@ private fun ScanProgressCard(statusText: String) {
 }
 
 // ── Cleanup Queue List (like the cleaner app) ───────────────────────────────────
+
+@Composable
+private fun RemoteAccessCard(
+    remoteAccess: RemoteAccessState,
+    onToggleRemoteAccess: () -> Unit,
+    onGrantDeleteAccess: () -> Unit
+) {
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 8.dp),
+        shape = RoundedCornerShape(22.dp),
+        colors = CardDefaults.cardColors(containerColor = TextDark),
+        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(20.dp),
+            verticalArrangement = Arrangement.spacedBy(14.dp)
+        ) {
+            Text(
+                text = "Wi-Fi Dashboard",
+                style = MaterialTheme.typography.titleLarge,
+                fontWeight = FontWeight.Bold,
+                color = Color.White
+            )
+            Text(
+                text = remoteAccess.statusText,
+                style = MaterialTheme.typography.bodyMedium,
+                color = Color.White.copy(alpha = 0.78f)
+            )
+
+            Surface(
+                shape = RoundedCornerShape(16.dp),
+                color = Color.White.copy(alpha = 0.06f)
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(14.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Text(
+                        text = remoteAccess.localUrl ?: "Start Wi-Fi access to show the browser URL.",
+                        style = MaterialTheme.typography.bodyLarge,
+                        fontWeight = FontWeight.SemiBold,
+                        color = Color.White
+                    )
+                    Text(
+                        text = remoteAccess.deleteHint,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Color.White.copy(alpha = 0.68f)
+                    )
+                }
+            }
+
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                StatusBadge(
+                    text = if (remoteAccess.isEnabled) "LAN server live" else "LAN server stopped",
+                    color = if (remoteAccess.isEnabled) PrimaryGreen.copy(alpha = 0.2f) else Color.White.copy(alpha = 0.08f),
+                    textColor = if (remoteAccess.isEnabled) PrimaryGreen else Color.White.copy(alpha = 0.8f)
+                )
+                StatusBadge(
+                    text = if (remoteAccess.remoteDeleteEnabled) "Browser delete enabled" else "Review-only until delete access is granted",
+                    color = if (remoteAccess.remoteDeleteEnabled) AccentBlue.copy(alpha = 0.2f) else AccentOrange.copy(alpha = 0.18f),
+                    textColor = if (remoteAccess.remoteDeleteEnabled) AccentBlue else AccentOrange
+                )
+            }
+
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                GreenButton(
+                    text = when {
+                        remoteAccess.isStarting -> "Starting..."
+                        remoteAccess.isEnabled -> "Stop Wi-Fi Access"
+                        else -> "Start Wi-Fi Access"
+                    },
+                    onClick = onToggleRemoteAccess,
+                    modifier = Modifier.weight(1f),
+                    enabled = !remoteAccess.isStarting
+                )
+                if (!remoteAccess.remoteDeleteEnabled) {
+                    OutlinedButton(
+                        onClick = onGrantDeleteAccess,
+                        modifier = Modifier.weight(1f),
+                        shape = RoundedCornerShape(16.dp),
+                        colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.White)
+                    ) {
+                        Text("Grant Delete Access")
+                    }
+                }
+            }
+        }
+    }
+}
 
 @Composable
 private fun CleanupQueueList(queues: List<QueueDefinition>, onOpenQueue: (CleanupQueueId) -> Unit) {
@@ -740,8 +884,7 @@ private fun ReviewScreen(
                 state = pagerState,
                 modifier = Modifier
                     .fillMaxWidth()
-                    .weight(1f),
-                beyondViewportPageCount = 1
+                    .weight(1f)
             ) { page ->
                 val entry = state.entries.getOrNull(page) ?: return@HorizontalPager
                 Column(
@@ -754,7 +897,8 @@ private fun ReviewScreen(
                             entry = entry,
                             onPreview = onPreview,
                             onDeleteLeft = onDeleteLeft, onDeleteRight = onDeleteRight,
-                            onDeleteBoth = onDeleteBoth, onKeep = onKeep
+                            onDeleteBoth = onDeleteBoth, onKeep = onKeep,
+                            onNext = onNext, onPrevious = onPrevious
                         )
                         is CleanupEntry.SingleEntry -> SingleEntryReview(
                             entry = entry,
@@ -1064,7 +1208,7 @@ private fun ThumbnailRail(
                     )
                     Card(
                         modifier = Modifier
-                            .width(100.dp)
+                            .width(120.dp)
                             .border(2.dp, borderColor, RoundedCornerShape(14.dp))
                             .combinedClickable(
                                 onClick = { if (selectionMode) onToggleSelection(entry.key) else onSelectEntry(entry.key) },
@@ -1083,7 +1227,7 @@ private fun ThumbnailRail(
                                 model = previewImage.uri, contentDescription = previewImage.name,
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .aspectRatio(1f)
+                                    .height(120.dp)
                                     .clip(RoundedCornerShape(12.dp)),
                                 contentScale = ContentScale.Crop
                             )
@@ -1214,7 +1358,7 @@ private fun queueVisuals(queueId: CleanupQueueId): Pair<ImageVector, Color> = wh
     CleanupQueueId.BLURRY -> Icons.Rounded.BlurOn to Color(0xFF78909C)
     CleanupQueueId.FORWARD -> Icons.AutoMirrored.Rounded.Forward to Color(0xFFFF9100)
     CleanupQueueId.SCREENSHOT -> Icons.Rounded.Screenshot to Color(0xFF00BFA5)
-    CleanupQueueId.TEXT_HEAVY -> Icons.Rounded.TextFields to Color(0xFF7C4DFF)
+    CleanupQueueId.TEXT_HEAVY -> Icons.Rounded.Shield to Color(0xFF7C4DFF)
 }
 
 private fun formatRelativeTime(millis: Long): String {
@@ -1228,5 +1372,50 @@ private fun formatRelativeTime(millis: Long): String {
         hours < 24 -> "${hours}h ago"
         days < 7 -> "${days}d ago"
         else -> DateFormat.getDateInstance(DateFormat.SHORT).format(millis)
+    }
+}
+
+@Composable
+private fun ConnectionStatusChip(networkStatus: NetworkStatusSnapshot) {
+    val (icon, label, color) = when (networkStatus.status) {
+        "Connected" -> Triple(Icons.Filled.CloudDone, "Connected", PrimaryGreen)
+        "ConnectedMetered" -> Triple(Icons.Filled.Sync, "Mobile Data", AccentOrange)
+        "Reconnecting" -> Triple(Icons.Filled.Sync, "Reconnecting...", AccentOrange)
+        else -> Triple(Icons.Filled.CloudOff, "Offline", AccentRed)
+    }
+    
+    AssistChip(
+        onClick = {},
+        label = { 
+            Text(
+                label,
+                style = MaterialTheme.typography.labelSmall,
+                fontSize = 11.sp
+            )
+        },
+        leadingIcon = {
+            Icon(
+                imageVector = icon,
+                contentDescription = null,
+                modifier = Modifier.size(16.dp),
+                tint = color
+            )
+        },
+        colors = AssistChipDefaults.assistChipColors(
+            containerColor = color.copy(alpha = 0.15f),
+            labelColor = color
+        ),
+        shape = RoundedCornerShape(20.dp)
+    )
+}
+
+private fun buildManageFilesAccessIntent(): Intent {
+    val packageUri = android.net.Uri.parse("package:com.saura.imagecleanupassistant.mobile")
+    return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+        Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION, packageUri)
+    } else {
+        Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION).apply {
+            data = packageUri
+        }
     }
 }

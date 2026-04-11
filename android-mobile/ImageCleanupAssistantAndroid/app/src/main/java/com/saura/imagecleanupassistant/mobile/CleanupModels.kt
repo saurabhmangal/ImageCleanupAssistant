@@ -1,6 +1,55 @@
 package com.saura.imagecleanupassistant.mobile
 
 import android.net.Uri
+import java.io.InputStream
+
+// ── Error Types ──────────────────────────────────────────────────────────────────
+
+sealed interface AppError {
+    val message: String
+    val isRetryable: Boolean
+    
+    data class NetworkError(
+        override val message: String = "Network connection lost",
+        val retryable: Boolean = true
+    ) : AppError {
+        override val isRetryable = retryable
+    }
+    
+    data class TimeoutError(
+        override val message: String = "Operation timed out. Please check your connection."
+    ) : AppError {
+        override val isRetryable = true
+    }
+    
+    data class PermissionError(
+        override val message: String = "Permission denied"
+    ) : AppError {
+        override val isRetryable = false
+    }
+    
+    data class StorageError(
+        override val message: String,
+        val needsPermission: Boolean = false
+    ) : AppError {
+        override val isRetryable = !needsPermission
+    }
+    
+    data class ScanError(
+        override val message: String,
+        val itemsProcessed: Int = 0,
+        val total: Int = 0
+    ) : AppError {
+        override val isRetryable = true
+    }
+    
+    data class DeleteError(
+        override val message: String,
+        val itemId: String
+    ) : AppError {
+        override val isRetryable = true
+    }
+}
 
 enum class CleanupQueueId {
     EXACT,
@@ -18,6 +67,7 @@ enum class AppScreen {
 
 const val ALL_SOURCE_ID = "__all__"
 const val ALL_FOLDERS_ID = "__all_folders__"
+const val DEFAULT_REMOTE_PORT = 9864
 
 data class ImageMetrics(
     val averageHash: String,
@@ -28,6 +78,8 @@ data class ImageMetrics(
     val edgeDensity: Double,
     val averageSaturation: Double,
     val whitePixelRatio: Double,
+    val darkPixelRatio: Double,
+    val dominantColorShare: Double,
     val uniqueColorCount: Int,
     val qualityScore: Double,
     val likelyBlurry: Boolean,
@@ -141,6 +193,33 @@ data class DeleteCommand(
     val successMessage: String
 )
 
+data class DirectDeleteResult(
+    val deletedIds: Set<Long>,
+    val errors: List<String>
+)
+
+data class RemoteImagePayload(
+    val fileName: String,
+    val mimeType: String,
+    val stream: InputStream
+)
+
+data class RemoteAccessState(
+    val isEnabled: Boolean = false,
+    val isStarting: Boolean = false,
+    val port: Int = DEFAULT_REMOTE_PORT,
+    val localUrl: String? = null,
+    val statusText: String = "Start Wi-Fi access to review this phone from another device.",
+    val remoteDeleteEnabled: Boolean = false,
+    val deleteHint: String = "Grant All files access on the phone to allow browser-driven deletes."
+)
+
+data class NetworkStatusSnapshot(
+    val status: String = "Offline",  // Connected, ConnectedMetered, Reconnecting, Offline
+    val isConnected: Boolean = false,
+    val isMetered: Boolean = false
+)
+
 data class UiState(
     val hasPermission: Boolean = false,
     val isScanning: Boolean = false,
@@ -158,7 +237,11 @@ data class UiState(
     val dismissedEntryKeys: Set<String> = emptySet(),
     val selectedEntryKeys: Set<String> = emptySet(),
     val selectedScanFolder: String? = null,
-    val availableFolders: List<FolderOption> = emptyList()
+    val availableFolders: List<FolderOption> = emptyList(),
+    val remoteAccess: RemoteAccessState = RemoteAccessState(),
+    val networkStatus: NetworkStatusSnapshot = NetworkStatusSnapshot(),
+    val currentError: AppError? = null,
+    val retryAttempts: Int = 0
 ) {
     val activeReviewEntry: CleanupEntry?
         get() = entries.firstOrNull { it.key == activeReviewKey }
@@ -190,6 +273,7 @@ data class UiState(
 sealed interface UiEvent {
     data class LaunchDeleteRequest(val command: DeleteCommand) : UiEvent
     data class ShowMessage(val message: String) : UiEvent
+    data class ShowError(val error: AppError) : UiEvent
 }
 
 fun defaultQueueDefinitions(): List<QueueDefinition> = listOf(
@@ -202,38 +286,38 @@ fun defaultQueueDefinitions(): List<QueueDefinition> = listOf(
     ),
     QueueDefinition(
         id = CleanupQueueId.SIMILAR,
-        title = "Similar Photos",
+        title = "Near Duplicates",
         count = 0,
-        description = "Stricter visual matches for resized or lightly edited copies.",
-        emptyText = "No strong similar-photo pairs were found."
+        description = "Same moment or same image saved more than once with light edits or compression.",
+        emptyText = "No strong near-duplicate pairs were found."
     ),
     QueueDefinition(
         id = CleanupQueueId.BLURRY,
-        title = "Blurry Photos",
+        title = "Low-Quality Shots",
         count = 0,
-        description = "Photos with weak sharpness and low edge detail.",
-        emptyText = "No blurry photos are waiting."
+        description = "Soft, dark, tiny, or heavily compressed shots that are usually safe to review for cleanup.",
+        emptyText = "No low-quality shots are waiting."
     ),
     QueueDefinition(
         id = CleanupQueueId.FORWARD,
-        title = "Likely Forwards",
+        title = "Messaging Clutter",
         count = 0,
-        description = "Greeting cards, festival wishes, quotes, and WhatsApp-style forwards.",
-        emptyText = "No likely forward images are waiting."
+        description = "WhatsApp forwards, memes, stickers, quote cards, greetings, and other shareable clutter.",
+        emptyText = "No messaging clutter is waiting."
     ),
     QueueDefinition(
         id = CleanupQueueId.SCREENSHOT,
         title = "Screenshots",
         count = 0,
-        description = "Captured screens and UI images.",
+        description = "Phone, app, browser, and screen-capture images that often pile up over time.",
         emptyText = "No screenshots are waiting."
     ),
     QueueDefinition(
         id = CleanupQueueId.TEXT_HEAVY,
-        title = "Text-Heavy",
+        title = "Documents",
         count = 0,
-        description = "Quote cards, posters, flyers, and text graphics.",
-        emptyText = "No text-heavy images are waiting."
+        description = "Receipts, scans, IDs, forms, tickets, notes, and other document-style images.",
+        emptyText = "No document images are waiting."
     )
 )
 

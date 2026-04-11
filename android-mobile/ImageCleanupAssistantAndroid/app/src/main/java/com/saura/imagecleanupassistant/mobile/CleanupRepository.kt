@@ -224,7 +224,7 @@ class CleanupRepository(private val context: Context) {
                 val image = snapshot.imagesById[id] ?: return@mapNotNull null
                 CleanupEntry.SingleEntry(
                     queueId = queueId, image = image, title = image.name,
-                    subtitle = "Likely WhatsApp forward, greeting, or poster-style image.",
+                    subtitle = "Likely meme, sticker, quote card, greeting, or WhatsApp-style share image.",
                     metaText = "${image.folder} | ${image.dimensionsText} | ${image.sizeText}"
                 )
             }
@@ -232,7 +232,7 @@ class CleanupRepository(private val context: Context) {
                 val image = snapshot.imagesById[id] ?: return@mapNotNull null
                 CleanupEntry.SingleEntry(
                     queueId = queueId, image = image, title = image.name,
-                    subtitle = "Looks like a screenshot or screen capture.",
+                    subtitle = "Looks like a phone, app, or browser screen capture.",
                     metaText = "${image.folder} | ${image.dimensionsText} | ${image.sizeText}"
                 )
             }
@@ -240,7 +240,7 @@ class CleanupRepository(private val context: Context) {
                 val image = snapshot.imagesById[id] ?: return@mapNotNull null
                 CleanupEntry.SingleEntry(
                     queueId = queueId, image = image, title = image.name,
-                    subtitle = "Text-heavy poster, quote, banner, or flyer style image.",
+                    subtitle = "Looks like a receipt, scan, ID, form, ticket, or document image.",
                     metaText = "${image.folder} | ${image.dimensionsText} | ${image.sizeText}"
                 )
             }
@@ -255,6 +255,42 @@ class CleanupRepository(private val context: Context) {
         persistSnapshot(rebuilt)
         return rebuilt
     }
+
+    fun findImagesByIds(snapshot: CleanupSnapshot, imageIds: Collection<Long>): List<MediaImage> =
+        imageIds.mapNotNull { snapshot.imagesById[it] }
+
+    fun openRemoteImage(image: MediaImage): RemoteImagePayload? {
+        val stream = context.contentResolver.openInputStream(image.uri) ?: return null
+        return RemoteImagePayload(
+            fileName = image.name,
+            mimeType = mimeTypeForImage(image.name),
+            stream = stream
+        )
+    }
+
+    suspend fun deleteImagesDirect(images: Collection<MediaImage>): DirectDeleteResult =
+        withContext(Dispatchers.IO) {
+            val deletedIds = linkedSetOf<Long>()
+            val errors = mutableListOf<String>()
+
+            images.forEach { image ->
+                runCatching {
+                    val deletedRows = context.contentResolver.delete(image.uri, null, null)
+                    if (deletedRows > 0) {
+                        deletedIds += image.id
+                    } else {
+                        errors += "${image.name}: Android did not confirm the delete."
+                    }
+                }.onFailure { error ->
+                    errors += "${image.name}: ${error.message ?: "Delete failed."}"
+                }
+            }
+
+            DirectDeleteResult(
+                deletedIds = deletedIds,
+                errors = errors
+            )
+        }
 
     fun queueCount(snapshot: CleanupSnapshot, queueId: CleanupQueueId): Int =
         when (queueId) {
@@ -315,6 +351,8 @@ class CleanupRepository(private val context: Context) {
                 put("edgeDensity", image.metrics.edgeDensity)
                 put("averageSaturation", image.metrics.averageSaturation)
                 put("whitePixelRatio", image.metrics.whitePixelRatio)
+                put("darkPixelRatio", image.metrics.darkPixelRatio)
+                put("dominantColorShare", image.metrics.dominantColorShare)
                 put("uniqueColorCount", image.metrics.uniqueColorCount)
                 put("qualityScore", image.metrics.qualityScore)
                 put("likelyBlurry", image.metrics.likelyBlurry)
@@ -351,6 +389,8 @@ class CleanupRepository(private val context: Context) {
                 edgeDensity = metricsJson.optDouble("edgeDensity", 0.0),
                 averageSaturation = metricsJson.optDouble("averageSaturation", 0.0),
                 whitePixelRatio = metricsJson.optDouble("whitePixelRatio", 0.0),
+                darkPixelRatio = metricsJson.optDouble("darkPixelRatio", 0.0),
+                dominantColorShare = metricsJson.optDouble("dominantColorShare", 0.0),
                 uniqueColorCount = metricsJson.optInt("uniqueColorCount", 0),
                 qualityScore = metricsJson.optDouble("qualityScore", 0.0),
                 likelyBlurry = metricsJson.optBoolean("likelyBlurry", false),
@@ -375,11 +415,19 @@ class CleanupRepository(private val context: Context) {
             similarPairs = similarPairs,
             blurryIds = images.asSequence()
                 .filter { it.metrics.likelyBlurry }
-                .sortedWith(compareBy<MediaImage> { it.metrics.sharpnessEstimate }.thenBy { it.metrics.edgeDensity }.thenByDescending { it.modifiedAtMillis })
+                .sortedWith(
+                    compareBy<MediaImage> { it.metrics.qualityScore }
+                        .thenByDescending { it.metrics.darkPixelRatio }
+                        .thenBy { it.metrics.sharpnessEstimate }
+                        .thenByDescending { it.modifiedAtMillis }
+                )
                 .map { it.id }.toList(),
             forwardIds = images.asSequence().filter { it.metrics.likelyForward }.sortedByDescending { it.modifiedAtMillis }.map { it.id }.toList(),
             screenshotIds = images.asSequence().filter { it.metrics.likelyScreenshot }.sortedByDescending { it.modifiedAtMillis }.map { it.id }.toList(),
-            textHeavyIds = images.asSequence().filter { it.metrics.likelyTextHeavy }.sortedByDescending { it.modifiedAtMillis }.map { it.id }.toList()
+            textHeavyIds = images.asSequence()
+                .filter { it.metrics.likelyTextHeavy }
+                .sortedWith(compareByDescending<MediaImage> { it.metrics.whitePixelRatio }.thenByDescending { it.modifiedAtMillis })
+                .map { it.id }.toList()
         )
     }
 
@@ -431,6 +479,16 @@ class CleanupRepository(private val context: Context) {
         val analysis = analyzeBitmapMetrics(raw.uri, raw.width, raw.height)
         val qualityScore = computeQualityScore(analysis.width, analysis.height, raw.sizeBytes, analysis.sharpnessEstimate)
         val nameAndFolder = "${raw.name} ${raw.folder}"
+        val screenshotScore = computeScreenshotScore(nameAndFolder, analysis, analysis.width, analysis.height)
+        val documentScore = computeDocumentScore(nameAndFolder, analysis, analysis.width, analysis.height)
+        val clutterScore = computeMessagingClutterScore(nameAndFolder, analysis, raw.sizeBytes, analysis.width, analysis.height)
+        val lowQualityScore = computeLowQualityScore(analysis, raw.sizeBytes, analysis.width, analysis.height, qualityScore)
+        val likelyScreenshot = screenshotScore >= 5
+        val likelyDocument = documentScore >= 5 && !(likelyScreenshot && documentScore < 7)
+        val likelyClutter = clutterScore >= 5 && !likelyDocument && !(likelyScreenshot && clutterScore < 7)
+        val likelyLowQuality = lowQualityScore >= 5 &&
+            !(likelyDocument && documentScore >= 7 && lowQualityScore < 7) &&
+            !(likelyScreenshot && screenshotScore >= 7 && lowQualityScore < 7)
 
         return MediaImage(
             id = raw.id, uri = raw.uri, name = raw.name, folder = raw.folder,
@@ -442,13 +500,14 @@ class CleanupRepository(private val context: Context) {
                 toneSignature = analysis.toneSignature,
                 sharpnessEstimate = analysis.sharpnessEstimate, brightness = analysis.brightness,
                 edgeDensity = analysis.edgeDensity, averageSaturation = analysis.averageSaturation,
-                whitePixelRatio = analysis.whitePixelRatio, uniqueColorCount = analysis.uniqueColorCount,
+                whitePixelRatio = analysis.whitePixelRatio, darkPixelRatio = analysis.darkPixelRatio,
+                dominantColorShare = analysis.dominantColorShare, uniqueColorCount = analysis.uniqueColorCount,
                 qualityScore = qualityScore,
-                likelyBlurry = computeBlurScore(analysis) >= 5 || (analysis.sharpnessEstimate <= 9.0 && analysis.edgeDensity <= 0.08),
-                blurText = "Sharpness ${formatNumber(analysis.sharpnessEstimate, 1)} | edge detail ${formatNumber(analysis.edgeDensity, 3)}",
-                likelyForward = computeForwardScore(nameAndFolder, analysis, raw.sizeBytes, analysis.width, analysis.height) >= 5,
-                likelyScreenshot = computeScreenshotScore(nameAndFolder, analysis, analysis.width, analysis.height) >= 5,
-                likelyTextHeavy = computeTextHeavyScore(nameAndFolder, analysis) >= 5
+                likelyBlurry = likelyLowQuality,
+                blurText = buildLowQualitySummary(analysis, raw.sizeBytes, analysis.width, analysis.height),
+                likelyForward = likelyClutter,
+                likelyScreenshot = likelyScreenshot,
+                likelyTextHeavy = likelyDocument
             )
         )
     }
@@ -577,8 +636,8 @@ class CleanupRepository(private val context: Context) {
     private fun selectDeleteCandidate(first: MediaImage, second: MediaImage): MediaImage {
         if (first.metrics.qualityScore < second.metrics.qualityScore) return first
         if (second.metrics.qualityScore < first.metrics.qualityScore) return second
-        val firstPenalty = deleteNamePenalty(first.name)
-        val secondPenalty = deleteNamePenalty(second.name)
+        val firstPenalty = deleteNamePenalty(first.name) + cleanupPenalty(first)
+        val secondPenalty = deleteNamePenalty(second.name) + cleanupPenalty(second)
         if (firstPenalty > secondPenalty) return first
         if (secondPenalty > firstPenalty) return second
         if (first.sizeBytes < second.sizeBytes) return first
@@ -606,7 +665,8 @@ class CleanupRepository(private val context: Context) {
             width = fallbackWidth.coerceAtLeast(1), height = fallbackHeight.coerceAtLeast(1),
             averageHash = "0".repeat(64), gradientHash = "0".repeat(64),
             toneSignature = IntArray(36), sharpnessEstimate = 0.0, brightness = 0.0,
-            edgeDensity = 0.0, averageSaturation = 0.0, whitePixelRatio = 0.0, uniqueColorCount = 0
+            edgeDensity = 0.0, averageSaturation = 0.0, whitePixelRatio = 0.0,
+            darkPixelRatio = 0.0, dominantColorShare = 0.0, uniqueColorCount = 0
         )
 
         val baseBitmap = decoded.bitmap
@@ -638,8 +698,11 @@ class CleanupRepository(private val context: Context) {
                 }
             }
 
-            val colorMap = HashSet<String>()
-            var whitePixels = 0; var saturationTotal = 0.0; var strongEdges = 0
+            val colorBuckets = HashMap<String, Int>()
+            var whitePixels = 0
+            var darkPixels = 0
+            var saturationTotal = 0.0
+            var strongEdges = 0
             val toneSignature = IntArray(36); var toneIndex = 0
 
             for (y in 0 until 24) for (x in 0 until 24) {
@@ -651,8 +714,10 @@ class CleanupRepository(private val context: Context) {
                 val maxChannel = max(red, max(green, blue))
                 val minChannel = min(red, min(green, blue))
                 saturationTotal += if (maxChannel == 0) 0.0 else (maxChannel - minChannel).toDouble() / maxChannel.toDouble()
-                colorMap += "${red / 32}-${green / 32}-${blue / 32}"
+                val bucketKey = "${red / 32}-${green / 32}-${blue / 32}"
+                colorBuckets[bucketKey] = (colorBuckets[bucketKey] ?: 0) + 1
                 if (gray >= 235.0) whitePixels += 1
+                if (gray <= 45.0) darkPixels += 1
                 if (x > 0 && abs(gray - grayscale(sample24.getPixel(x - 1, y))) >= 55.0) strongEdges += 1
                 if (y > 0 && abs(gray - grayscale(sample24.getPixel(x, y - 1))) >= 55.0) strongEdges += 1
             }
@@ -665,13 +730,16 @@ class CleanupRepository(private val context: Context) {
                 toneSignature[toneIndex++] = (blockTotal / 16.0).roundToInt()
             }
 
+            val dominantColorShare = (colorBuckets.values.maxOrNull() ?: 0) / 576.0
+
             BitmapAnalysis(
                 width = decoded.width.coerceAtLeast(fallbackWidth).coerceAtLeast(1),
                 height = decoded.height.coerceAtLeast(fallbackHeight).coerceAtLeast(1),
                 averageHash = averageHash, gradientHash = gradientHash, toneSignature = toneSignature,
                 sharpnessEstimate = contrastTotal / 112.0, brightness = brightnessTotal / 64.0,
                 edgeDensity = strongEdges / 1104.0, averageSaturation = saturationTotal / 576.0,
-                whitePixelRatio = whitePixels / 576.0, uniqueColorCount = colorMap.size
+                whitePixelRatio = whitePixels / 576.0, darkPixelRatio = darkPixels / 576.0,
+                dominantColorShare = dominantColorShare, uniqueColorCount = colorBuckets.size
             )
         } finally {
             sample8.recycle(); sample9x8.recycle(); sample24.recycle(); baseBitmap.recycle()
@@ -700,24 +768,31 @@ class CleanupRepository(private val context: Context) {
         return (megapixels * 3.8) + (sharpnessEstimate * 1.8) + (sizeMegabytes * 0.7)
     }
 
-    private fun computeForwardScore(nameAndFolder: String, metrics: BitmapAnalysis, sizeBytes: Long, width: Int, height: Int): Int {
+    private fun computeMessagingClutterScore(nameAndFolder: String, metrics: BitmapAnalysis, sizeBytes: Long, width: Int, height: Int): Int {
         var score = 0
-        val hasKeyword = FORWARD_REGEX.containsMatchIn(nameAndFolder)
-        val isWhatsAppFolder = nameAndFolder.contains("whatsapp", ignoreCase = true)
-        val hasWhatsAppFilename = nameAndFolder.contains("-WA", ignoreCase = false) || nameAndFolder.contains("WA0", ignoreCase = false)
-        val hasWhatsAppIndicator = isWhatsAppFolder || hasWhatsAppFilename
+        val lower = nameAndFolder.lowercase(Locale.ROOT)
+        val hasKeyword = CLUTTER_REGEX.containsMatchIn(lower)
+        val messagingSource = MESSAGE_SOURCE_REGEX.containsMatchIn(lower) || WHATSAPP_NAME_REGEX.containsMatchIn(nameAndFolder)
+        val aspectRatio = metrics.width.toDouble() / metrics.height.coerceAtLeast(1).toDouble()
+        val balancedGraphicRatio = aspectRatio in 0.55..1.8
         if (hasKeyword) score += 4
-        if (isWhatsAppFolder && !hasKeyword) score += 2
-        if (hasWhatsAppFilename) score += 3
-        if (sizeBytes in 1 until 300_000 && max(width, height) >= 600) score += 2
-        if (metrics.averageSaturation >= 0.24) score += 1
-        val uniqueColorThreshold = if (hasWhatsAppIndicator) 160 else 130
-        if (metrics.uniqueColorCount <= uniqueColorThreshold) score += 1
+        if (messagingSource) score += 3
+        if (sizeBytes in 1 until 450_000 && max(width, height) in 500..2500) score += 1
+        if (metrics.averageSaturation >= 0.18) score += 1
+        if (metrics.uniqueColorCount <= 170) score += 1
+        if (metrics.dominantColorShare >= 0.12) score += 1
         if (metrics.edgeDensity >= 0.10) score += 1
-        if (metrics.whitePixelRatio <= 0.45) score += 1
-        if ((metrics.width.toDouble() / metrics.height.coerceAtLeast(1).toDouble()) <= 1.35) score += 1
+        if (metrics.whitePixelRatio <= 0.60) score += 1
+        if (balancedGraphicRatio) score += 1
         if (metrics.width <= 2200 && metrics.height <= 2200) score += 1
-        return if (hasKeyword || hasWhatsAppIndicator || (isWhatsAppFolder && sizeBytes < 400_000) || (metrics.uniqueColorCount <= 100 && metrics.edgeDensity >= 0.14 && metrics.averageSaturation >= 0.22)) score else 0
+
+        val strongGraphicPattern =
+            metrics.uniqueColorCount <= 120 &&
+                metrics.dominantColorShare >= 0.15 &&
+                metrics.edgeDensity >= 0.12 &&
+                metrics.averageSaturation >= 0.18
+
+        return if (hasKeyword || messagingSource || strongGraphicPattern) score else 0
     }
 
     private fun computeScreenshotScore(nameAndFolder: String, metrics: BitmapAnalysis, width: Int, height: Int): Int {
@@ -732,42 +807,97 @@ class CleanupRepository(private val context: Context) {
         if (metrics.edgeDensity >= 0.14) score += 1
         if (metrics.whitePixelRatio >= 0.24) score += 1
         if (metrics.averageSaturation <= 0.34) score += 1
+        if (metrics.darkPixelRatio <= 0.22) score += 1
         val w = min(width, height); val h = max(width, height)
         val isDeviceResolution = (w == 1080 && h in setOf(1920, 2400, 2340, 2160)) ||
             (w == 1440 && h in setOf(3200, 2560, 3120)) ||
             (w == 720 && h in setOf(1280, 1520, 1600)) ||
             (w == 828 && h == 1792) || (w == 1170 && h == 2532) ||
             (w == 1284 && h == 2778) || (w == 1125 && h == 2436) ||
-            (w == 1242 && h in setOf(2688, 2208))
+            (w == 1242 && h in setOf(2688, 2208)) ||
+            (w == 1080 && h == 1080) || (w == 1179 && h == 2556) ||
+            (w == 1920 && h == 1080) || (w == 1366 && h == 768)
         if (isDeviceResolution) score += 2
-        return if (hasKeyword || (ratio in 1.7..2.3 && metrics.whitePixelRatio >= 0.28 && metrics.edgeDensity >= 0.15) || (isDeviceResolution && ratio in 1.7..2.3)) score else 0
+        return if (
+            hasKeyword ||
+            (ratio in 1.7..2.3 && metrics.whitePixelRatio >= 0.28 && metrics.edgeDensity >= 0.15) ||
+            (isDeviceResolution && ratio in 1.7..2.3)
+        ) score else 0
     }
 
-    private fun computeTextHeavyScore(nameAndFolder: String, metrics: BitmapAnalysis): Int {
+    private fun computeDocumentScore(nameAndFolder: String, metrics: BitmapAnalysis, width: Int, height: Int): Int {
         var score = 0
-        val hasKeyword = TEXT_HEAVY_REGEX.containsMatchIn(nameAndFolder)
+        val hasKeyword = DOCUMENT_REGEX.containsMatchIn(nameAndFolder)
+        val scanSource = DOCUMENT_SOURCE_REGEX.containsMatchIn(nameAndFolder)
+        val tallScreenRatio = max(
+            width.toDouble() / height.coerceAtLeast(1).toDouble(),
+            height.toDouble() / width.coerceAtLeast(1).toDouble()
+        ) in 1.7..2.3
         if (hasKeyword) score += 3
-        if (metrics.edgeDensity >= 0.18) score += 1
-        if (metrics.whitePixelRatio >= 0.30) score += 1
-        if (metrics.uniqueColorCount <= 90) score += 1
-        if (metrics.averageSaturation <= 0.32) score += 1
-        if (metrics.width <= 1800 && metrics.height <= 1800) score += 1
-        return if (hasKeyword || (metrics.whitePixelRatio >= 0.34 && metrics.edgeDensity >= 0.18 && metrics.uniqueColorCount <= 85)) score else 0
+        if (scanSource) score += 3
+        if (metrics.whitePixelRatio >= 0.42) score += 2
+        if (metrics.edgeDensity >= 0.12) score += 1
+        if (metrics.uniqueColorCount <= 130) score += 1
+        if (metrics.averageSaturation <= 0.22) score += 1
+        if (metrics.darkPixelRatio <= 0.12) score += 1
+        if ((width.toDouble() / height.coerceAtLeast(1).toDouble()) in 0.65..1.55) score += 1
+
+        val documentLikeShape =
+            metrics.whitePixelRatio >= 0.48 &&
+                metrics.averageSaturation <= 0.18 &&
+                metrics.edgeDensity >= 0.11 &&
+                metrics.uniqueColorCount <= 120 &&
+                !tallScreenRatio
+
+        return if (hasKeyword || scanSource || documentLikeShape) score else 0
     }
 
-    private fun computeBlurScore(metrics: BitmapAnalysis): Int {
+    private fun computeLowQualityScore(
+        metrics: BitmapAnalysis,
+        sizeBytes: Long,
+        width: Int,
+        height: Int,
+        qualityScore: Double
+    ): Int {
         var score = 0
         when {
             metrics.sharpnessEstimate <= 7.0 -> score += 4
             metrics.sharpnessEstimate <= 10.0 -> score += 3
-            metrics.sharpnessEstimate <= 14.0 -> score += 2
-            metrics.sharpnessEstimate <= 17.0 -> score += 1
+            metrics.sharpnessEstimate <= 13.0 -> score += 2
+            metrics.sharpnessEstimate <= 16.0 -> score += 1
         }
         when {
-            metrics.edgeDensity <= 0.05 -> score += 2
-            metrics.edgeDensity <= 0.07 -> score += 1
+            metrics.edgeDensity <= 0.045 -> score += 2
+            metrics.edgeDensity <= 0.065 -> score += 1
         }
+        when {
+            metrics.brightness <= 55.0 || metrics.darkPixelRatio >= 0.55 -> score += 2
+            metrics.brightness <= 72.0 || metrics.darkPixelRatio >= 0.38 -> score += 1
+        }
+        if (min(width, height) < 720 || max(width, height) < 1100) score += 1
+        if (sizeBytes in 1 until 120_000 && max(width, height) < 1800) score += 1
+        if (qualityScore < 6.5) score += 1
         return score
+    }
+
+    private fun buildLowQualitySummary(metrics: BitmapAnalysis, sizeBytes: Long, width: Int, height: Int): String {
+        val reasons = mutableListOf<String>()
+        if (metrics.sharpnessEstimate <= 10.0) reasons += "soft focus"
+        if (metrics.darkPixelRatio >= 0.38 || metrics.brightness <= 72.0) reasons += "underexposed"
+        if (min(width, height) < 720 || max(width, height) < 1100) reasons += "small resolution"
+        if (sizeBytes in 1 until 120_000 && max(width, height) < 1800) reasons += "compressed"
+        if (reasons.isEmpty()) reasons += "weak detail"
+        return reasons.joinToString(" · ") +
+            " | sharpness ${formatNumber(metrics.sharpnessEstimate, 1)} | dark ${formatNumber(metrics.darkPixelRatio * 100.0, 0)}%"
+    }
+
+    private fun cleanupPenalty(image: MediaImage): Int {
+        var penalty = 0
+        if (image.metrics.likelyBlurry) penalty += 2
+        if (image.metrics.likelyForward) penalty += 2
+        if (image.metrics.likelyScreenshot) penalty += 1
+        if (image.metrics.likelyTextHeavy) penalty += 1
+        return penalty
     }
 
     private fun hammingDistance(first: String, second: String): Int {
@@ -786,7 +916,13 @@ class CleanupRepository(private val context: Context) {
         return total / length.toDouble()
     }
 
-    private fun deleteNamePenalty(name: String): Int = if (DELETE_NAME_REGEX.containsMatchIn(name)) 3 else 0
+    private fun deleteNamePenalty(name: String): Int {
+        var penalty = 0
+        if (DELETE_NAME_REGEX.containsMatchIn(name)) penalty += 3
+        if (WHATSAPP_NAME_REGEX.containsMatchIn(name)) penalty += 2
+        if (DOWNLOADED_NAME_REGEX.containsMatchIn(name)) penalty += 1
+        return penalty
+    }
 
     private fun nameAffinityScore(firstName: String, secondName: String): Int {
         val firstCore = normalizeNameCore(firstName)
@@ -804,7 +940,7 @@ class CleanupRepository(private val context: Context) {
 
     private fun normalizeNameCore(name: String): String =
         name.substringBeforeLast('.')
-            .replace(Regex("(?i)(copy|edited|duplicate)"), " ")
+            .replace(Regex("(?i)(copy|edited|duplicate|downloaded)"), " ")
             .replace(Regex("[_\\-()\\[\\].]+"), " ")
             .replace(Regex("\\s+"), " ")
             .trim().lowercase(Locale.ROOT)
@@ -818,13 +954,25 @@ class CleanupRepository(private val context: Context) {
     private fun formatNumber(value: Double, decimals: Int): String =
         String.format(Locale.US, "%.${decimals}f", value)
 
+    private fun mimeTypeForImage(name: String): String =
+        when (name.substringAfterLast('.', "").lowercase(Locale.ROOT)) {
+            "jpg", "jpeg" -> "image/jpeg"
+            "png" -> "image/png"
+            "gif" -> "image/gif"
+            "bmp" -> "image/bmp"
+            "webp" -> "image/webp"
+            "tif", "tiff" -> "image/tiff"
+            else -> "application/octet-stream"
+        }
+
     private data class DecodedBitmap(val bitmap: Bitmap, val width: Int, val height: Int)
 
     private data class BitmapAnalysis(
         val width: Int, val height: Int,
         val averageHash: String, val gradientHash: String, val toneSignature: IntArray,
         val sharpnessEstimate: Double, val brightness: Double, val edgeDensity: Double,
-        val averageSaturation: Double, val whitePixelRatio: Double, val uniqueColorCount: Int
+        val averageSaturation: Double, val whitePixelRatio: Double, val darkPixelRatio: Double,
+        val dominantColorShare: Double, val uniqueColorCount: Int
     )
 
     private companion object {
@@ -837,13 +985,17 @@ class CleanupRepository(private val context: Context) {
         const val KEY_DISMISSED_KEYS = "dismissed_keys"
         const val KEY_LAST_SCAN_MILLIS = "last_scan_millis"
 
-        val FORWARD_REGEX = Regex(
-            "(?i)(diwali|holi|eid|christmas|xmas|new.?year|good.?morning|good.?night|quote|motivational|motivation|blessing|blessings|shayari|status|suvichar|thought|wish|greeting|festival|birthday|anniversary|invitation|whatsapp|sharechat|suprabhat|shubh|navratri|durga|krishna|radha|ganesh|mahadev|shiva|ram.?navami|janmashtami|raksha.?bandhan|karwa.?chauth|chhath|makar.?sankranti|lohri|baisakhi|pongal|onam|ugadi|gudi.?padwa|happy.?sunday|happy.?monday|happy.?tuesday|happy.?wednesday|happy.?thursday|happy.?friday|happy.?saturday)"
+        val CLUTTER_REGEX = Regex(
+            "(?i)(diwali|holi|eid|christmas|xmas|new.?year|good.?morning|good.?night|quote|motivational|motivation|blessing|blessings|shayari|status|suvichar|thought|wish|greeting|festival|birthday|anniversary|invitation|meme|funny|reaction|sticker|whatsapp|telegram|sharechat|instagram|facebook|snapchat|suprabhat|shubh|navratri|durga|krishna|radha|ganesh|mahadev|shiva|ram.?navami|janmashtami|raksha.?bandhan|karwa.?chauth|chhath|makar.?sankranti|lohri|baisakhi|pongal|onam|ugadi|gudi.?padwa|happy.?sunday|happy.?monday|happy.?tuesday|happy.?wednesday|happy.?thursday|happy.?friday|happy.?saturday)"
         )
+        val MESSAGE_SOURCE_REGEX = Regex("(?i)(whatsapp|telegram|sharechat|instagram|facebook|snapchat|status|stories|download)")
         val SCREENSHOT_REGEX = Regex("(?i)(screenshot|screen.?shot|screen_capture|capture|screenshots|screen.?grab|screenrecord)")
-        val TEXT_HEAVY_REGEX = Regex(
-            "(?i)(quote|motivational|motivation|shayari|suvichar|thought|wish|greeting|invitation|poster|banner|flyer|notice|good.?morning|good.?night|festival|diwali|holi|new.?year|infographic|certificate|resume|brochure|pamphlet|circular|memo|announcement|newsletter|recipe|menu|schedule|timetable|syllabus|exam|result|admit.?card|marksheet|aadhaar|pan.?card|document)"
+        val DOCUMENT_REGEX = Regex(
+            "(?i)(receipt|invoice|bill|statement|document|scan|scanner|camscanner|adobescan|aadhaar|aadhar|pan.?card|passport|license|licence|voter|certificate|resume|brochure|pamphlet|memo|newsletter|menu|schedule|timetable|syllabus|exam|result|admit.?card|marksheet|ticket|boarding|prescription|medical|lab.?report|report|notes|assignment|form|application|id.?card)"
         )
+        val DOCUMENT_SOURCE_REGEX = Regex("(?i)(scan|scanner|camscanner|adobe.?scan|documents|docs|receipts)")
+        val WHATSAPP_NAME_REGEX = Regex("(?i)(-WA\\d+|IMG-\\d{8}-WA\\d+|VID-\\d{8}-WA\\d+|WA0\\d+)")
+        val DOWNLOADED_NAME_REGEX = Regex("(?i)(download|saved|export|share)")
         val DELETE_NAME_REGEX = Regex("(?i)(copy|edited|duplicate|_copy|-copy|\\(\\d+\\))")
     }
 }

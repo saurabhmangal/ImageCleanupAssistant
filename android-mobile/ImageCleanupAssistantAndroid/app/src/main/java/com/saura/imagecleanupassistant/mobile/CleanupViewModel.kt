@@ -2,24 +2,144 @@ package com.saura.imagecleanupassistant.mobile
 
 import android.app.Application
 import android.net.Uri
+import android.os.Environment
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import org.json.JSONArray
+import org.json.JSONObject
+import java.net.Inet4Address
+import java.net.NetworkInterface
+import java.util.Collections
 
 class CleanupViewModel(application: Application) : AndroidViewModel(application) {
 
     private val repository = CleanupRepository(application.applicationContext)
+    private val networkStatusManager = NetworkStatusManager(application.applicationContext)
+    @Volatile
     private var snapshot: CleanupSnapshot = CleanupSnapshot.EMPTY
+    private var remoteServer: RemoteAccessServer? = null
 
     private val _state = MutableStateFlow(UiState())
     val state = _state.asStateFlow()
 
     private val _events = MutableSharedFlow<UiEvent>(extraBufferCapacity = 4)
     val events = _events.asSharedFlow()
+
+    private val remoteController = object : RemoteAccessServer.Controller {
+        override fun sessionJson(): JSONObject = buildRemoteSessionJson()
+
+        override fun entriesJson(queueId: String?, sourceId: String?): JSONObject =
+            buildRemoteEntriesJson(queueId = queueId, sourceId = sourceId)
+
+        override fun startScan(folder: String?): JSONObject = startRemoteScan(folder)
+
+        override fun deleteImages(imageIds: Set<Long>): JSONObject = deleteImagesFromRemote(imageIds)
+
+        override fun openImage(imageId: Long): RemoteImagePayload? = openRemoteImage(imageId)
+    }
+
+    init {
+        refreshRemoteCapabilities()
+        observeNetworkStatus()
+    }
+
+    private fun observeNetworkStatus() {
+        viewModelScope.launch {
+            networkStatusManager.observeStatus().collect { status ->
+                val statusText = when (status) {
+                    NetworkStatusManager.NetworkStatus.Connected -> "Connected"
+                    NetworkStatusManager.NetworkStatus.ConnectedMetered -> "ConnectedMetered"
+                    NetworkStatusManager.NetworkStatus.Reconnecting -> "Reconnecting"
+                    NetworkStatusManager.NetworkStatus.Offline -> "Offline"
+                }
+                
+                _state.value = _state.value.copy(
+                    networkStatus = NetworkStatusSnapshot(
+                        status = statusText,
+                        isConnected = status == NetworkStatusManager.NetworkStatus.Connected || 
+                                     status == NetworkStatusManager.NetworkStatus.ConnectedMetered,
+                        isMetered = status == NetworkStatusManager.NetworkStatus.ConnectedMetered
+                    )
+                )
+            }
+        }
+    }
+
+    fun clearError() {
+        _state.value = _state.value.copy(currentError = null, retryAttempts = 0)
+    }
+
+    fun retryLastOperation() {
+        val error = _state.value.currentError ?: return
+        if (!error.isRetryable) return
+        
+        val attempts = _state.value.retryAttempts + 1
+        _state.value = _state.value.copy(retryAttempts = attempts)
+        
+        when (error) {
+            is AppError.ScanError -> scanLibrary()
+            is AppError.DeleteError -> {} // Handle delete retry if needed
+            else -> scanLibrary()
+        }
+    }
+
+    fun refreshRemoteCapabilities() {
+        applyRemoteAccessState()
+    }
+
+    fun toggleRemoteAccess() {
+        val current = _state.value
+        if (!current.hasPermission) {
+            _events.tryEmit(UiEvent.ShowMessage("Grant photo access on the phone before starting Wi-Fi access."))
+            return
+        }
+
+        if (remoteServer != null || current.remoteAccess.isStarting) {
+            remoteServer?.stop()
+            remoteServer = null
+            applyRemoteAccessState(
+                isEnabled = false,
+                isStarting = false,
+                statusText = "Wi-Fi dashboard stopped."
+            )
+            return
+        }
+
+        applyRemoteAccessState(
+            isEnabled = false,
+            isStarting = true,
+            statusText = "Starting Wi-Fi dashboard..."
+        )
+
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val server = RemoteAccessServer(DEFAULT_REMOTE_PORT, remoteController)
+                server.start(5_000, false)
+                remoteServer = server
+                applyRemoteAccessState(
+                    isEnabled = true,
+                    isStarting = false,
+                    statusText = "Open the address below on another device connected to the same Wi-Fi."
+                )
+            } catch (error: Exception) {
+                remoteServer = null
+                applyRemoteAccessState(
+                    isEnabled = false,
+                    isStarting = false,
+                    statusText = error.message ?: "Could not start the Wi-Fi dashboard."
+                )
+                _events.emit(UiEvent.ShowMessage(error.message ?: "Could not start the Wi-Fi dashboard."))
+            }
+        }
+    }
 
     fun restoreCachedStateIfAvailable() {
         if (_state.value.isScanning || _state.value.imageCount > 0) return
@@ -69,6 +189,7 @@ class CleanupViewModel(application: Application) : AndroidViewModel(application)
         )
         _state.value = restoredState
         repository.persistUiSession(restoredState)
+        applyRemoteAccessState()
     }
 
     fun refreshPermission(hasPermission: Boolean) {
@@ -82,6 +203,7 @@ class CleanupViewModel(application: Application) : AndroidViewModel(application)
         )
         _state.value = updated
         repository.persistUiSession(updated)
+        applyRemoteAccessState()
     }
 
     fun loadAvailableFolders() {
@@ -97,6 +219,13 @@ class CleanupViewModel(application: Application) : AndroidViewModel(application)
     }
 
     fun scanLibrary() {
+        launchScan()
+    }
+
+    private fun launchScan(
+        folderOverride: String? = _state.value.selectedScanFolder,
+        preferredSourceId: String? = null
+    ) {
         val current = _state.value
         if (!current.hasPermission || current.isScanning) {
             if (!current.hasPermission) {
@@ -108,13 +237,14 @@ class CleanupViewModel(application: Application) : AndroidViewModel(application)
         viewModelScope.launch {
             val scanningState = _state.value.copy(
                 isScanning = true,
-                statusText = "Starting library scan..."
+                statusText = "Starting library scan...",
+                selectedScanFolder = folderOverride
             )
             _state.value = scanningState
             repository.persistUiSession(scanningState)
 
             try {
-                val folderFilter = _state.value.selectedScanFolder
+                val folderFilter = folderOverride
                 val scannedSnapshot = repository.scanLibrary(
                     folderFilter = folderFilter
                 ) { progressText ->
@@ -123,7 +253,7 @@ class CleanupViewModel(application: Application) : AndroidViewModel(application)
 
                 snapshot = scannedSnapshot
                 val availableSources = repository.buildSourceOptions(scannedSnapshot)
-                val selectedSourceId = _state.value.selectedSourceId
+                val selectedSourceId = (preferredSourceId ?: _state.value.selectedSourceId)
                     .takeIf { sourceId -> availableSources.any { it.id == sourceId } }
                     ?: ALL_SOURCE_ID
                 val scopedSnapshot = repository.filterSnapshotBySource(scannedSnapshot, selectedSourceId)
@@ -163,14 +293,34 @@ class CleanupViewModel(application: Application) : AndroidViewModel(application)
                 )
                 _state.value = scannedState
                 repository.persistUiSession(scannedState)
+                applyRemoteAccessState()
             } catch (error: Exception) {
+                val appError = when (error) {
+                    is java.io.IOException -> AppError.NetworkError(
+                        "Network error during scan: ${error.message ?: \"Unknown error\"}"
+                    )
+                    is java.util.concurrent.TimeoutException -> AppError.TimeoutError(
+                        "Scan timed out. Check your connection and retry."
+                    )
+                    is SecurityException -> AppError.PermissionError(
+                        "Storage permission denied during scan"
+                    )
+                    else -> AppError.ScanError(
+                        error.message ?: "Scan failed",
+                        itemsProcessed = 0,
+                        total = 0
+                    )
+                }
+                
                 val failedState = _state.value.copy(
                     isScanning = false,
-                    statusText = "Scan failed."
+                    statusText = appError.message,
+                    currentError = appError
                 )
                 _state.value = failedState
                 repository.persistUiSession(failedState)
-                _events.emit(UiEvent.ShowMessage(error.message ?: "Scan failed."))
+                applyRemoteAccessState()
+                _events.emit(UiEvent.ShowError(appError))
             }
         }
     }
@@ -450,7 +600,280 @@ class CleanupViewModel(application: Application) : AndroidViewModel(application)
         )
         _state.value = updated
         repository.persistUiSession(updated)
+        applyRemoteAccessState()
     }
+
+    private fun buildRemoteSessionJson(): JSONObject {
+        val current = _state.value
+        val availableFolders = current.availableFolders.ifEmpty {
+            runBlocking { repository.queryAvailableFolders() }
+        }
+        val fullSummary = buildSummaryText(snapshot)
+        val queues = repository.buildQueueDefinitions(snapshot)
+        val sources = repository.buildSourceOptions(snapshot)
+
+        return JSONObject().apply {
+            put("hasPermission", current.hasPermission)
+            put("isScanning", current.isScanning)
+            put("statusText", current.statusText)
+            put("summaryText", if (snapshot.imagesById.isEmpty()) "No photos scanned yet." else fullSummary)
+            put("imageCount", snapshot.imagesById.size)
+            put("totalReviewItems", queues.sumOf { it.count })
+            put("activeQueueCount", queues.count { it.count > 0 })
+            put("lastScanMillis", current.lastScanMillis ?: JSONObject.NULL)
+            put("selectedScanFolder", current.selectedScanFolder ?: JSONObject.NULL)
+            put(
+                "availableFolders",
+                JSONArray().apply {
+                    availableFolders.forEach { folder ->
+                        put(
+                            JSONObject()
+                                .put("folder", folder.folder)
+                                .put("count", folder.count)
+                        )
+                    }
+                }
+            )
+            put(
+                "availableSources",
+                JSONArray().apply {
+                    sources.forEach { source ->
+                        put(
+                            JSONObject()
+                                .put("id", source.id)
+                                .put("title", source.title)
+                                .put("count", source.count)
+                        )
+                    }
+                }
+            )
+            put(
+                "queues",
+                JSONArray().apply {
+                    queues.forEach { queue ->
+                        put(
+                            JSONObject()
+                                .put("id", queue.id.name)
+                                .put("title", queue.title)
+                                .put("count", queue.count)
+                                .put("description", queue.description)
+                                .put("emptyText", queue.emptyText)
+                        )
+                    }
+                }
+            )
+            put(
+                "remoteAccess",
+                JSONObject().apply {
+                    put("isEnabled", current.remoteAccess.isEnabled)
+                    put("isStarting", current.remoteAccess.isStarting)
+                    put("port", current.remoteAccess.port)
+                    put("localUrl", current.remoteAccess.localUrl ?: JSONObject.NULL)
+                    put("statusText", current.remoteAccess.statusText)
+                    put("remoteDeleteEnabled", current.remoteAccess.remoteDeleteEnabled)
+                    put("deleteHint", current.remoteAccess.deleteHint)
+                }
+            )
+        }
+    }
+
+    private fun buildRemoteEntriesJson(queueId: String?, sourceId: String?): JSONObject {
+        val requestedQueue = queueId
+            ?.runCatching { CleanupQueueId.valueOf(this) }
+            ?.getOrNull()
+            ?: CleanupQueueId.EXACT
+        val availableSources = repository.buildSourceOptions(snapshot)
+        val normalizedSourceId = sourceId
+            ?.takeIf { wanted -> availableSources.any { it.id == wanted } }
+            ?: ALL_SOURCE_ID
+        val scopedSnapshot = repository.filterSnapshotBySource(snapshot, normalizedSourceId)
+        val entries = repository.buildEntries(
+            snapshot = scopedSnapshot,
+            queueId = requestedQueue,
+            dismissedEntryKeys = _state.value.dismissedEntryKeys
+        )
+        val definition = queueDefinition(requestedQueue)
+
+        return JSONObject().apply {
+            put("queueId", requestedQueue.name)
+            put("sourceId", normalizedSourceId)
+            put("emptyText", definition.emptyText)
+            put(
+                "entries",
+                JSONArray().apply {
+                    entries.forEach { entry -> put(remoteEntryJson(entry)) }
+                }
+            )
+        }
+    }
+
+    private fun remoteEntryJson(entry: CleanupEntry): JSONObject =
+        when (entry) {
+            is CleanupEntry.PairEntry -> JSONObject().apply {
+                put("kind", "pair")
+                put("key", entry.key)
+                put("title", entry.title)
+                put("subtitle", entry.subtitle)
+                put("metaText", entry.metaText)
+                put("confidence", entry.pair.confidence)
+                put("suggestedDeleteId", entry.pair.suggestedDeleteId)
+                put("first", remoteImageJson(entry.first))
+                put("second", remoteImageJson(entry.second))
+            }
+            is CleanupEntry.SingleEntry -> JSONObject().apply {
+                put("kind", "single")
+                put("key", entry.key)
+                put("title", entry.title)
+                put("subtitle", entry.subtitle)
+                put("metaText", entry.metaText)
+                put("image", remoteImageJson(entry.image))
+            }
+        }
+
+    private fun remoteImageJson(image: MediaImage): JSONObject =
+        JSONObject().apply {
+            put("id", image.id)
+            put("name", image.name)
+            put("folder", image.folder)
+            put("dimensionsText", image.dimensionsText)
+            put("sizeText", image.sizeText)
+        }
+
+    private fun startRemoteScan(folder: String?): JSONObject {
+        val current = _state.value
+        if (!current.hasPermission) {
+            return JSONObject()
+                .put("accepted", false)
+                .put("error", "Grant photo access on the phone before scanning.")
+        }
+        if (current.isScanning) {
+            return JSONObject()
+                .put("accepted", false)
+                .put("error", "A scan is already running.")
+        }
+
+        val normalizedFolder = folder?.takeIf { it.isNotBlank() && it != ALL_FOLDERS_ID }
+        val updated = current.copy(
+            selectedScanFolder = normalizedFolder,
+            selectedSourceId = ALL_SOURCE_ID
+        )
+        _state.value = updated
+        repository.persistUiSession(updated)
+        launchScan(folderOverride = normalizedFolder, preferredSourceId = ALL_SOURCE_ID)
+
+        return JSONObject()
+            .put("accepted", true)
+            .put("folder", normalizedFolder ?: JSONObject.NULL)
+    }
+
+    private fun deleteImagesFromRemote(imageIds: Set<Long>): JSONObject = runBlocking {
+        if (imageIds.isEmpty()) {
+            return@runBlocking JSONObject()
+                .put("deletedIds", JSONArray())
+                .put("errors", JSONArray().put("No images were selected."))
+        }
+        if (!Environment.isExternalStorageManager()) {
+            return@runBlocking JSONObject()
+                .put("deletedIds", JSONArray())
+                .put("errors", JSONArray().put("Grant All files access on the phone to enable browser-driven delete."))
+        }
+
+        val images = repository.findImagesByIds(snapshot, imageIds)
+        if (images.isEmpty()) {
+            return@runBlocking JSONObject()
+                .put("deletedIds", JSONArray())
+                .put("errors", JSONArray().put("Those images are no longer available."))
+        }
+
+        val result = repository.deleteImagesDirect(images)
+        if (result.deletedIds.isNotEmpty()) {
+            snapshot = repository.rebuildSnapshotAfterDelete(snapshot, result.deletedIds)
+            val current = _state.value
+            val availableSources = repository.buildSourceOptions(snapshot)
+            val selectedSourceId = current.selectedSourceId
+                .takeIf { sourceId -> availableSources.any { it.id == sourceId } }
+                ?: ALL_SOURCE_ID
+            val scopedSnapshot = repository.filterSnapshotBySource(snapshot, selectedSourceId)
+            val selectedQueue = choosePreferredQueue(scopedSnapshot, current.selectedQueueId)
+            val newEntries = repository.buildEntries(scopedSnapshot, selectedQueue, current.dismissedEntryKeys)
+            val updated = current.copy(
+                summaryText = buildSummaryText(scopedSnapshot),
+                queues = repository.buildQueueDefinitions(scopedSnapshot),
+                availableSources = availableSources,
+                selectedSourceId = selectedSourceId,
+                selectedQueueId = selectedQueue,
+                entries = newEntries,
+                activeReviewKey = newEntries.firstOrNull()?.key,
+                imageCount = scopedSnapshot.imagesById.size,
+                selectedEntryKeys = emptySet(),
+                statusText = "Deleted ${result.deletedIds.size} photo(s) from the browser."
+            )
+            _state.value = updated
+            repository.persistUiSession(updated)
+            applyRemoteAccessState()
+        }
+
+        JSONObject().apply {
+            put(
+                "deletedIds",
+                JSONArray().apply {
+                    result.deletedIds.forEach { deletedId -> put(deletedId) }
+                }
+            )
+            put(
+                "errors",
+                JSONArray().apply {
+                    result.errors.forEach { error -> put(error) }
+                }
+            )
+        }
+    }
+
+    private fun openRemoteImage(imageId: Long): RemoteImagePayload? =
+        snapshot.imagesById[imageId]?.let(repository::openRemoteImage)
+
+    private fun applyRemoteAccessState(
+        isEnabled: Boolean = remoteServer != null,
+        isStarting: Boolean = false,
+        statusText: String? = null
+    ) {
+        val localUrl = if (isEnabled) resolveLocalUrl(DEFAULT_REMOTE_PORT) else null
+        val hasDeleteAccess = Environment.isExternalStorageManager()
+        val resolvedStatus = statusText ?: when {
+            isStarting -> "Starting Wi-Fi dashboard..."
+            isEnabled && localUrl != null -> "Open the address below on another device connected to the same Wi-Fi."
+            isEnabled -> "Wi-Fi dashboard is running, but the phone does not currently expose a Wi-Fi address."
+            else -> "Start Wi-Fi access to review this phone from another device."
+        }
+
+        _state.value = _state.value.copy(
+            remoteAccess = RemoteAccessState(
+                isEnabled = isEnabled,
+                isStarting = isStarting,
+                port = DEFAULT_REMOTE_PORT,
+                localUrl = localUrl,
+                statusText = resolvedStatus,
+                remoteDeleteEnabled = hasDeleteAccess,
+                deleteHint = if (hasDeleteAccess) {
+                    "Browser delete is enabled. Photos are removed directly from the phone."
+                } else {
+                    "Browser review works now. To delete from the browser too, grant All files access in the Android app."
+                }
+            )
+        )
+    }
+
+    private fun resolveLocalUrl(port: Int): String? =
+        runCatching {
+            Collections.list(NetworkInterface.getNetworkInterfaces())
+                .asSequence()
+                .filter { it.isUp && !it.isLoopback }
+                .flatMap { network -> Collections.list(network.inetAddresses).asSequence() }
+                .filterIsInstance<Inet4Address>()
+                .firstOrNull { !it.isLoopbackAddress && it.isSiteLocalAddress }
+                ?.hostAddress
+                ?.let { address -> "http://$address:$port" }
+        }.getOrNull()
 
     private fun launchDeleteCommand(command: DeleteCommand) {
         _events.tryEmit(UiEvent.LaunchDeleteRequest(command))
@@ -482,4 +905,10 @@ class CleanupViewModel(application: Application) : AndroidViewModel(application)
 
     private fun queueDefinition(queueId: CleanupQueueId): QueueDefinition =
         defaultQueueDefinitions().first { it.id == queueId }
+
+    override fun onCleared() {
+        remoteServer?.stop()
+        remoteServer = null
+        super.onCleared()
+    }
 }
